@@ -1,21 +1,19 @@
 /**
- * Wrapper de inferencia + postprocesado para YOLO11-seg (ONNX, formato Ultralytics).
- * Entradas del modelo: "images" [1,3,640,640]
- * Salidas: "output0" [1,116,8400] (4 caja + 80 clases + 32 coef. de máscara)
- *          "output1" [1,32,160,160] (prototipos de máscara)
+ * Wrapper de inferencia + postprocesado para YOLO11-seg, usando TensorFlow.js
+ * (grafo convertido desde el SavedModel de Ultralytics con tensorflowjs_converter).
+ * Entrada del modelo: "images" [1,640,640,3] float32 NHWC
+ * Salidas: output_0 [1,116,8400] (4 caja + 80 clases + 32 coef. de máscara, igual que en ONNX)
+ *          output_1 [1,160,160,32] (prototipos de máscara, NHWC)
  */
 const YOLO_INPUT_SIZE = 640;
 const YOLO_NUM_CLASSES = 80;
 const YOLO_NUM_MASKS = 32;
 const PROTO_SIZE = 160;
-// Soporte float16 nativo (Chrome/Edge recientes); si no existe, sólo se puede usar un model.onnx en FP32.
-const HAS_NATIVE_FLOAT16 = typeof Float16Array !== "undefined";
 
 class YoloSegModel {
   constructor() {
-    this.session = null;
+    this.model = null;
     this.backend = null;
-    this.inputType = "float32"; // detectado en load() mediante una pasada de calentamiento
     this._letterboxCanvas = document.createElement("canvas");
     this._letterboxCanvas.width = YOLO_INPUT_SIZE;
     this._letterboxCanvas.height = YOLO_INPUT_SIZE;
@@ -23,77 +21,27 @@ class YoloSegModel {
   }
 
   async load(modelUrl, onStatus) {
-    this._modelUrl = modelUrl;
-    const cacheKey = `yolo-backend:${modelUrl}`;
-    const cached = safeLocalStorageGet(cacheKey);
+    // Los nombres reales de los tensores de salida no coinciden siempre con el orden
+    // output_0/output_1 declarado en la firma, así que se leen explícitamente del model.json.
+    const manifest = await (await fetch(modelUrl)).json();
+    const outputs = manifest.signature?.outputs ?? manifest.userDefinedMetadata?.signature?.outputs;
+    this._outputNames = [outputs.output_0.name, outputs.output_1.name];
 
-    const providerAttempts = [
-      { name: "webgpu", options: [{ executionProviders: ["webgpu"] }] },
-      { name: "wasm", options: [{ executionProviders: ["wasm"] }] },
-    ];
-    // Si ya sabemos qué combinación funcionó antes, probamos esa primero para
-    // evitar repetir en cada carga la sonda fallida de WebGPU (kernels no
-    // soportados registran errores en consola aunque el fallback funcione bien).
-    if (cached) {
-      providerAttempts.sort((a, b) => (a.name === cached.backend ? -1 : b.name === cached.backend ? 1 : 0));
-    }
-
-    for (const attempt of providerAttempts) {
+    // WebGPU es el "delegate" de GPU real de tf.js; wasm (SIMD/threads) y cpu son fallback universal.
+    const backendAttempts = ["webgpu", "wasm", "cpu"];
+    for (const backend of backendAttempts) {
       try {
-        onStatus?.(`Cargando modelo (${attempt.name})…`);
-        this.session = await ort.InferenceSession.create(modelUrl, attempt.options[0]);
-        this.backend = attempt.name;
-        const preferredType = cached?.backend === attempt.name ? cached.inputType : undefined;
-        await this._detectInputType(onStatus, preferredType);
-        safeLocalStorageSet(cacheKey, { backend: this.backend, inputType: this.inputType });
-        return attempt.name;
+        onStatus?.(`Cargando modelo (${backend})…`);
+        await tf.setBackend(backend);
+        await tf.ready();
+        this.model = await tf.loadGraphModel(modelUrl);
+        this.backend = tf.getBackend();
+        return this.backend;
       } catch (err) {
-        console.warn(`Fallo backend ${attempt.name}:`, err);
+        console.warn(`Fallo backend ${backend}:`, err);
       }
     }
-    throw new Error("No se pudo inicializar ningún backend de onnxruntime-web");
-  }
-
-  /**
-   * El export con quantize=16 deja el modelo (entradas y salidas) en float16.
-   * Se detecta con una pasada de calentamiento en vez de asumirlo, para que la
-   * app funcione igual con un model.onnx en fp32 o en fp16. Si se conoce el tipo
-   * que funcionó antes para este backend, se prueba primero para minimizar ruido.
-   */
-  async _detectInputType(onStatus, preferredType) {
-    const dummyShape = [1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE];
-    const plane = 3 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE;
-    let candidates = HAS_NATIVE_FLOAT16 ? ["float32", "float16"] : ["float32"];
-    if (preferredType && candidates.includes(preferredType)) {
-      candidates = [preferredType, ...candidates.filter((t) => t !== preferredType)];
-    }
-    for (const type of candidates) {
-      try {
-        const data = type === "float32" ? new Float32Array(plane) : new Float16Array(plane);
-        await this.session.run({ images: new ort.Tensor(type, data, dummyShape) });
-        this.inputType = type;
-        onStatus?.(`Modelo listo (${type})`);
-        return;
-      } catch (err) {
-        console.warn(`Entrada ${type} no aceptada:`, err.message);
-      }
-    }
-    throw new Error(
-      HAS_NATIVE_FLOAT16
-        ? "El modelo no acepta entradas float32 ni float16"
-        : "El modelo requiere float16, pero este navegador no soporta Float16Array (usa un model.onnx en FP32)"
-    );
-  }
-
-  /**
-   * Recarga el modelo forzando el backend WASM (algunos kernels, p.ej. el
-   * Softmax del módulo DFL de YOLO, no están soportados por el JSEP de WebGPU).
-   */
-  async _fallbackToWasm(onStatus) {
-    onStatus?.("WebGPU falló en un kernel, recargando con WASM…");
-    this.session = await ort.InferenceSession.create(this._modelUrl, { executionProviders: ["wasm"] });
-    this.backend = "wasm";
-    await this._detectInputType(onStatus);
+    throw new Error("No se pudo inicializar ningún backend de TensorFlow.js");
   }
 
   /**
@@ -114,42 +62,25 @@ class YoloSegModel {
     ctx.fillRect(0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
     ctx.drawImage(videoEl, 0, 0, srcW, srcH, padX, padY, newW, newH);
 
-    const { data } = ctx.getImageData(0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
-    const plane = YOLO_INPUT_SIZE * YOLO_INPUT_SIZE;
-    const chw = new Float32Array(3 * plane);
-    for (let i = 0; i < plane; i++) {
-      const o = i * 4;
-      chw[i] = data[o] / 255;
-      chw[plane + i] = data[o + 1] / 255;
-      chw[2 * plane + i] = data[o + 2] / 255;
-    }
+    // NHWC directo desde el canvas: más simple y rápido que empaquetar CHW a mano.
+    const tensor = tf.tidy(() =>
+      tf.browser.fromPixels(this._letterboxCanvas).toFloat().div(255).expandDims(0)
+    );
 
-    const inputData = this.inputType === "float16" ? new Float16Array(chw) : chw;
-
-    return {
-      tensor: new ort.Tensor(this.inputType, inputData, [1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE]),
-      scale, padX, padY, srcW, srcH,
-    };
+    return { tensor, scale, padX, padY, srcW, srcH };
   }
 
-  async infer(videoEl, { confThres = 0.45, iouThres = 0.45, maskThres = 0.5 } = {}, onStatus) {
+  async infer(videoEl, { confThres = 0.45, iouThres = 0.45, maskThres = 0.5 } = {}) {
     const pre = this._preprocess(videoEl);
-    const feeds = { images: pre.tensor };
 
-    let results;
-    try {
-      results = await this.session.run(feeds);
-    } catch (err) {
-      if (this.backend === "webgpu") {
-        await this._fallbackToWasm(onStatus);
-        results = await this.session.run(this._rebuildFeeds(pre));
-      } else {
-        throw err;
-      }
-    }
+    const [out0, out1] = this.model.execute({ images: pre.tensor }, this._outputNames);
 
-    const output0 = toFloat32(results.output0);
-    const output1 = toFloat32(results.output1);
+    const output0 = await out0.data(); // [116,8400] (mismo layout que en ONNX)
+    const output1 = await out1.data(); // [160,160,32] NHWC
+
+    pre.tensor.dispose();
+    out0.dispose();
+    out1.dispose();
 
     const { detections, debug } = this._decode(output0, pre, confThres);
     const kept = this._nms(detections, iouThres);
@@ -158,13 +89,6 @@ class YoloSegModel {
     }
     kept.debug = debug;
     return kept;
-  }
-
-  // El calentamiento tras el fallback puede cambiar this.inputType; reconstruye el tensor si hace falta.
-  _rebuildFeeds(pre) {
-    const raw = pre.tensor.type === "float16" ? Float32Array.from(pre.tensor.data) : pre.tensor.data;
-    const data = this.inputType === "float16" ? new Float16Array(raw) : Float32Array.from(raw);
-    return { images: new ort.Tensor(this.inputType, data, pre.tensor.dims) };
   }
 
   _decode(output0, pre, confThres) {
@@ -249,25 +173,27 @@ class YoloSegModel {
     const w = Math.max(1, ix2 - ix1);
     const h = Math.max(1, iy2 - iy1);
 
-    const plane = PROTO_SIZE * PROTO_SIZE;
     const color = classColorRgb(det.classId);
     const imgData = new ImageData(w, h);
-    for (let yy = 0; yy < h; yy++) {
-      for (let xx = 0; xx < w; xx++) {
-        const py = iy1 + yy;
-        const px = ix1 + xx;
-        let sum = 0;
-        const protoIdx = py * PROTO_SIZE + px;
-        for (let c = 0; c < YOLO_NUM_MASKS; c++) {
-          sum += det.maskCoeffs[c] * protoData[c * plane + protoIdx];
-        }
-        const v = sigmoid(sum);
-        const o = (yy * w + xx) * 4;
-        if (v > maskThres) {
-          imgData.data[o] = color[0];
-          imgData.data[o + 1] = color[1];
-          imgData.data[o + 2] = color[2];
-          imgData.data[o + 3] = 130;
+    if (protoData) {
+      for (let yy = 0; yy < h; yy++) {
+        for (let xx = 0; xx < w; xx++) {
+          const py = iy1 + yy;
+          const px = ix1 + xx;
+          let sum = 0;
+          // Prototipos NHWC: el canal es el eje más rápido -> índice (y*W+x)*C + c
+          const base = (py * PROTO_SIZE + px) * YOLO_NUM_MASKS;
+          for (let c = 0; c < YOLO_NUM_MASKS; c++) {
+            sum += det.maskCoeffs[c] * protoData[base + c];
+          }
+          const v = sigmoid(sum);
+          const o = (yy * w + xx) * 4;
+          if (v > maskThres) {
+            imgData.data[o] = color[0];
+            imgData.data[o + 1] = color[1];
+            imgData.data[o + 2] = color[2];
+            imgData.data[o + 3] = 130;
+          }
         }
       }
     }
@@ -295,43 +221,6 @@ function sigmoid(x) {
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
 }
-
-function safeLocalStorageGet(key) {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function safeLocalStorageSet(key, value) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // almacenamiento no disponible (modo privado, cuota, etc.): no es crítico
-  }
-}
-
-// Conversión IEEE-754 float32 <-> float16 para navegadores sin Float16Array nativo.
-// Ya no se usa para construir tensores de entrada (onnxruntime-web exige un
-// Float16Array real), pero se deja como referencia/lectura de salidas si hiciera falta.
-function float16BitsToFloat32(h) {
-  const sign = (h & 0x8000) >> 15;
-  const exp = (h & 0x7c00) >> 10;
-  const frac = h & 0x03ff;
-  if (exp === 0) return (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
-  if (exp === 0x1f) return frac ? NaN : (sign ? -1 : 1) * Infinity;
-  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
-}
-
-// Normaliza cualquier tensor de salida (float32 o float16) a un Float32Array plano.
-// Con Float16Array nativo, indexar ya devuelve números JS normales.
-function toFloat32(tensor) {
-  if (tensor.type !== "float16") return tensor.data;
-  return HAS_NATIVE_FLOAT16 ? Float32Array.from(tensor.data) : Float32Array.from(tensor.data, float16BitsToFloat32);
-}
-
 
 function iou(a, b) {
   const x1 = Math.max(a[0], b[0]);

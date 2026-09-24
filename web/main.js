@@ -1,8 +1,5 @@
-// Configuración de onnxruntime-web (WebGPU con fallback a WASM)
-ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
-// El multi-hilo (SharedArrayBuffer) sólo funciona en un contexto "cross-origin isolated"
-// (cabeceras COOP/COEP, servidas por server.js). Si no está disponible, cae a 1 hilo.
-ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(navigator.hardwareConcurrency || 4, 4) : 1;
+// Configuración de TensorFlow.js (WebGPU con fallback a WASM/CPU)
+tf.wasm.setWasmPaths("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/");
 
 const video = document.getElementById("video");
 const overlay = document.getElementById("overlay");
@@ -48,8 +45,8 @@ btnSwitch.addEventListener("click", async () => {
 });
 
 async function ensureModelLoaded() {
-  if (model.session) return;
-  const backend = await model.load("model.onnx", (msg) => (statusEl.textContent = msg));
+  if (model.model) return;
+  const backend = await model.load("tfjs_model/model.json", (msg) => (statusEl.textContent = msg));
   console.log("Backend activo:", backend);
 }
 
@@ -86,11 +83,7 @@ async function loop() {
   const t0 = performance.now();
 
   try {
-    const detections = await model.infer(
-      video,
-      { confThres, iouThres: 0.45, maskThres: 0.5 },
-      (msg) => (statusEl.textContent = msg)
-    );
+    const detections = await model.infer(video, { confThres, iouThres: 0.45, maskThres: 0.5 });
     draw(detections);
     if (running) statusEl.textContent = `Detectando (${model.backend})`;
     if (detections.debug) {
