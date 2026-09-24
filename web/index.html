@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+<title>YOLO11 Segmentación (WebGPU)</title>
+<link rel="stylesheet" href="style.css?v=2" />
+</head>
+<body>
+  <div id="app">
+    <div id="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div id="hud">
+      <div id="status">Iniciando…</div>
+      <div id="debugScores"></div>
+      <div id="fps">-- FPS</div>
+    </div>
+
+    <div id="controls">
+      <button id="btnStart">Iniciar cámara</button>
+      <button id="btnSwitch" disabled>Cambiar cámara</button>
+      <label class="slider-label">
+        Confianza <span id="confVal">0.45</span>
+        <input type="range" id="confSlider" min="0.05" max="0.9" step="0.05" value="0.45" />
+      </label>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.webgpu.min.js" crossorigin="anonymous"></script>
+  <script src="coco-classes.js?v=5"></script>
+  <script src="yolo.js?v=5"></script>
+  <script src="main.js?v=5"></script>
+</body>
+</html>
