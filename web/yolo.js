@@ -24,17 +24,28 @@ class YoloSegModel {
 
   async load(modelUrl, onStatus) {
     this._modelUrl = modelUrl;
+    const cacheKey = `yolo-backend:${modelUrl}`;
+    const cached = safeLocalStorageGet(cacheKey);
+
     const providerAttempts = [
       { name: "webgpu", options: [{ executionProviders: ["webgpu"] }] },
       { name: "wasm", options: [{ executionProviders: ["wasm"] }] },
     ];
+    // Si ya sabemos qué combinación funcionó antes, probamos esa primero para
+    // evitar repetir en cada carga la sonda fallida de WebGPU (kernels no
+    // soportados registran errores en consola aunque el fallback funcione bien).
+    if (cached) {
+      providerAttempts.sort((a, b) => (a.name === cached.backend ? -1 : b.name === cached.backend ? 1 : 0));
+    }
 
     for (const attempt of providerAttempts) {
       try {
         onStatus?.(`Cargando modelo (${attempt.name})…`);
         this.session = await ort.InferenceSession.create(modelUrl, attempt.options[0]);
         this.backend = attempt.name;
-        await this._detectInputType(onStatus);
+        const preferredType = cached?.backend === attempt.name ? cached.inputType : undefined;
+        await this._detectInputType(onStatus, preferredType);
+        safeLocalStorageSet(cacheKey, { backend: this.backend, inputType: this.inputType });
         return attempt.name;
       } catch (err) {
         console.warn(`Fallo backend ${attempt.name}:`, err);
@@ -46,12 +57,16 @@ class YoloSegModel {
   /**
    * El export con quantize=16 deja el modelo (entradas y salidas) en float16.
    * Se detecta con una pasada de calentamiento en vez de asumirlo, para que la
-   * app funcione igual con un model.onnx en fp32 o en fp16.
+   * app funcione igual con un model.onnx en fp32 o en fp16. Si se conoce el tipo
+   * que funcionó antes para este backend, se prueba primero para minimizar ruido.
    */
-  async _detectInputType(onStatus) {
+  async _detectInputType(onStatus, preferredType) {
     const dummyShape = [1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE];
     const plane = 3 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE;
-    const candidates = HAS_NATIVE_FLOAT16 ? ["float32", "float16"] : ["float32"];
+    let candidates = HAS_NATIVE_FLOAT16 ? ["float32", "float16"] : ["float32"];
+    if (preferredType && candidates.includes(preferredType)) {
+      candidates = [preferredType, ...candidates.filter((t) => t !== preferredType)];
+    }
     for (const type of candidates) {
       try {
         const data = type === "float32" ? new Float32Array(plane) : new Float16Array(plane);
@@ -279,6 +294,23 @@ function sigmoid(x) {
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function safeLocalStorageGet(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeLocalStorageSet(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // almacenamiento no disponible (modo privado, cuota, etc.): no es crítico
+  }
 }
 
 // Conversión IEEE-754 float32 <-> float16 para navegadores sin Float16Array nativo.
