@@ -88,6 +88,34 @@ Si reexportas el `.onnx`, sustituye `web/model.onnx` (el nombre de archivo y las
 entradas/salidas `images` / `output0` / `output1` deben mantenerse, o habrá que ajustar
 `yolo.js`).
 
+## Despliegue automático (GitHub Pages)
+
+El workflow [.github/workflows/deploy-pages.yml](.github/workflows/deploy-pages.yml)
+publica el contenido de `web/` (excepto `certs/` y `server.js`, que sólo hacen falta para
+HTTPS local) en GitHub Pages en cada push a `main` que toque esa carpeta.
+
+Pasos de configuración (una sola vez, en el repositorio de GitHub):
+1. **Settings → Pages → Build and deployment → Source**: elegir **"GitHub Actions"**
+   (no "Deploy from a branch").
+2. Hacer push a `main` — el workflow se ejecuta solo y publica la web en
+   `https://<usuario>.github.io/<repo>/`.
+3. También se puede lanzar a mano desde **Actions → Deploy web app to GitHub Pages →
+   Run workflow**.
+
+Diferencias respecto al servidor local (`server.js`):
+- GitHub Pages ya sirve por **HTTPS** con certificado válido → no hace falta aceptar
+  ningún aviso de certificado, y `getUserMedia` funciona directamente en el móvil.
+- GitHub Pages **no permite fijar cabeceras personalizadas**, así que no se puede activar
+  `Cross-Origin-Opener-Policy`/`Cross-Origin-Embedder-Policy` ahí. Resultado: en
+  producción el fallback WASM corre siempre a **1 hilo** (`crossOriginIsolated` será
+  `false`); WebGPU no se ve afectado por esto. Si en el futuro se necesita WASM
+  multi-hilo en producción, hay que servir desde una plataforma que permita esas
+  cabeceras (Cloudflare Pages, Netlify, Vercel, un servidor propio, etc.).
+
+`web/model.onnx` ahora se versiona en git (se quitó de `.gitignore`) porque GitHub Pages
+sólo publica archivos del repositorio; si el modelo creciera mucho o cambiara a menudo,
+valdría la pena migrarlo a [Git LFS](https://git-lfs.com/).
+
 ## Sobre el flag `half` al exportar
 
 ```
