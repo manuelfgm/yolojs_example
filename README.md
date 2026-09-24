@@ -18,9 +18,6 @@ web/
 ├── tfjs_model/           # grafo TF.js convertido (model.json + group1-shard*.bin)
 ├── server.js            # servidor HTTPS estático para pruebas (necesario en móvil)
 └── certs/               # certificado autofirmado usado por server.js
-
-scripts/
-└── fix_dfl_softmax_axis.py   # (histórico) parche ONNX del intento con onnxruntime-web
 ```
 
 ## Flujo completo: del `.pt` a la app
@@ -35,7 +32,7 @@ flowchart TD
 ```
 
 1. **`yolo11n-seg.pt`**: pesos originales de Ultralytics.
-2. **Export a ONNX**: `yolo export model=yolo11n-seg.pt format=onnx opset=17` → `yolo11n-seg.onnx` (FP32). Ya no lo usa la app en producción, pero es el punto de partida y queda como referencia junto con `scripts/fix_dfl_softmax_axis.py` (ver [Historial](#historial-por-qué-tensorflowjs-y-no-onnxruntime-web)).
+2. **Export a ONNX**: `yolo export model=yolo11n-seg.pt format=onnx opset=17` → `yolo11n-seg.onnx` (FP32). Ya no lo usa la app en producción; era el punto de partida del intento previo con `onnxruntime-web` (ver [Historial](#historial-por-qué-tensorflowjs-y-no-onnxruntime-web)).
 3. **ONNX → SavedModel**, llamando directamente a la función interna de Ultralytics para poder pasar `disable_group_convolution=True` (necesario, ver más abajo):
    ```python
    from ultralytics.utils.export.tensorflow import onnx2saved_model
@@ -172,8 +169,8 @@ dos bloqueos reales (no eran errores de configuración):
 1. **Softmax fuera del último eje**: el módulo DFL de YOLO11 (`Reshape → Transpose →
    Softmax(axis=1) → Conv`) hace softmax sobre un eje intermedio de un tensor
    `[1,16,4,8400]`. El backend WebGPU (JSEP) de `onnxruntime-web` en la versión usada solo
-   soporta softmax sobre el **último** eje. Se llegó a parchear el grafo ONNX
-   (`scripts/fix_dfl_softmax_axis.py`, insertando `Transpose`s) y funcionó, pero reveló
+   soporta softmax sobre el **último** eje. Se llegó a parchear el grafo ONNX insertando
+   `Transpose`s (script ya retirado del repo) y funcionó, pero reveló
    que la cobertura de operadores de ese backend va muy por detrás de WASM.
 2. **Convoluciones agrupadas (`groups>1`)**: al migrar a TensorFlow.js nos encontramos con
    un problema análogo pero en un motor distinto: `onnx2tf` convertía las convoluciones
