@@ -1,47 +1,87 @@
-# YOLO11-seg en el navegador (WebGPU + onnxruntime-web)
+# YOLO11-seg en el navegador (TensorFlow.js + WebGPU)
 
 Segmentación de instancias en tiempo real usando la cámara del dispositivo, pensada para
 abrirse principalmente desde un **móvil**. Corre 100% en el cliente (no hay backend de
-inferencia): carga `model.onnx` con `onnxruntime-web`, probando primero **WebGPU** y
-haciendo *fallback* automático a **WASM** si algún kernel no está soportado.
+inferencia): carga un grafo de **TensorFlow.js** con `@tensorflow/tfjs`, probando primero
+el backend **WebGPU** (GPU real vía la API WebGPU del navegador) y haciendo *fallback*
+automático a **WASM** y luego **CPU** si no está disponible.
 
 ## Estructura
 
 ```
 web/
-├── index.html        # UI (vídeo + canvas overlay + controles)
+├── index.html          # UI (vídeo + canvas overlay + controles)
 ├── style.css
-├── main.js            # cámara, bucle de inferencia, dibujado
-├── yolo.js            # carga del modelo, preprocesado, decodificación, NMS, máscaras
-├── coco-classes.js    # nombres de clases COCO y colores
-├── model.onnx         # copia de yolo11n-seg.onnx
-├── server.js           # servidor HTTPS estático para pruebas (necesario en móvil)
-└── certs/             # certificado autofirmado usado por server.js
+├── main.js             # cámara, bucle de inferencia, dibujado
+├── yolo.js              # carga del modelo, preprocesado, decodificación, NMS, máscaras
+├── coco-classes.js     # nombres de clases COCO y colores
+├── tfjs_model/           # grafo TF.js convertido (model.json + group1-shard*.bin)
+├── server.js            # servidor HTTPS estático para pruebas (necesario en móvil)
+└── certs/               # certificado autofirmado usado por server.js
+
+scripts/
+└── fix_dfl_softmax_axis.py   # (histórico) parche ONNX del intento con onnxruntime-web
 ```
 
-## Cómo funciona
+## Flujo completo: del `.pt` a la app
 
-1. **Captura**: `getUserMedia` obtiene el stream de la cámara (trasera por defecto,
-   botón para alternar a la frontal).
-2. **Preprocesado**: cada frame se redimensiona con *letterbox* a 640×640 (relleno gris,
-   igual que en el entrenamiento) y se normaliza a `float32` CHW.
-3. **Inferencia**: `onnxruntime-web` ejecuta `model.onnx`, que devuelve:
-   - `output0` `[1,116,8400]` → 4 coords de caja + 80 puntuaciones de clase + 32
-     coeficientes de máscara, por cada una de las 8400 celdas.
-   - `output1` `[1,32,160,160]` → prototipos de máscara.
-4. **Postprocesado** (`yolo.js`): se filtra por confianza, se aplica NMS por clase, y
-   para cada detección se reconstruye su máscara combinando los coeficientes con los
-   prototipos (sigmoide + umbral).
-5. **Dibujado**: cajas, etiqueta+score y máscara semitransparente sobre un `<canvas>`
-   superpuesto al `<video>` (mismo tamaño y `object-fit` para que coincidan píxel a píxel).
+```mermaid
+flowchart TD
+    A["yolo11n-seg.pt<br/>(pesos PyTorch, se descarga solo si falta)"] -->|"yolo export format=onnx opset=17"| B["yolo11n-seg.onnx<br/>(FP32, formato Ultralytics)"]
+    B -->|"onnx2saved_model()<br/>disable_group_convolution=True"| C["yolo11n-seg_saved_model/<br/>(TensorFlow SavedModel)"]
+    C -->|"tensorflowjs_converter<br/>(venv aislado .venv-tfjs)"| D["web/tfjs_model/<br/>model.json + group1-shard*.bin"]
+    D -->|"tf.loadGraphModel()"| E["yolo.js: YoloSegModel"]
+    E --> F["main.js: cámara + bucle de inferencia"]
+```
 
-### Fallback WebGPU → WASM
+1. **`yolo11n-seg.pt`**: pesos originales de Ultralytics.
+2. **Export a ONNX**: `yolo export model=yolo11n-seg.pt format=onnx opset=17` → `yolo11n-seg.onnx` (FP32). Ya no lo usa la app en producción, pero es el punto de partida y queda como referencia junto con `scripts/fix_dfl_softmax_axis.py` (ver [Historial](#historial-por-qué-tensorflowjs-y-no-onnxruntime-web)).
+3. **ONNX → SavedModel**, llamando directamente a la función interna de Ultralytics para poder pasar `disable_group_convolution=True` (necesario, ver más abajo):
+   ```python
+   from ultralytics.utils.export.tensorflow import onnx2saved_model
+   onnx2saved_model("yolo11n-seg.onnx", "yolo11n-seg_saved_model",
+                     disable_group_convolution=True, cuda=False)
+   ```
+4. **SavedModel → TF.js**, en un **venv aislado** (`.venv-tfjs`) para evitar el conflicto de `protobuf` entre `onnx`/`tensorflow`/`tensorflow_decision_forests`:
+   ```bash
+   python3 -m venv .venv-tfjs && source .venv-tfjs/bin/activate
+   pip install tensorflowjs
+   tensorflowjs_converter --input_format=tf_saved_model \
+     --output_format=tfjs_graph_model --signature_name=serving_default \
+     yolo11n-seg_saved_model web/tfjs_model
+   ```
+5. **Carga en el navegador**: `yolo.js` lee `web/tfjs_model/model.json`, extrae los
+   nombres reales de los tensores de salida (ver nota más abajo) y llama a
+   `tf.loadGraphModel()` probando backend `webgpu → wasm → cpu`.
+6. **Inferencia por frame**: `main.js` captura el frame de cámara; `yolo.js` hace el
+   letterbox + `tf.browser.fromPixels`, ejecuta `model.execute(...)`, decodifica
+   cajas/clases/máscaras y dibuja sobre el `<canvas>`.
 
-Algunos kernels (p. ej. el `Softmax` del módulo DFL de YOLO) no están implementados en
-el backend JSEP de WebGPU en la versión actual de `onnxruntime-web` y lanzan un error en
-tiempo de ejecución. Si esto ocurre, `yolo.js` recarga automáticamente la sesión forzando
-WASM y reintenta, sin necesidad de recargar la página. El HUD indica el backend activo
-("Detectando (webgpu)" / "Detectando (wasm)").
+> Si vuelves a entrenar o reexportar el `.pt`, hay que repetir los pasos 2-4 a mano (no
+> existe un único comando `yolo export format=tfjs` en esta versión de Ultralytics).
+
+## Cómo funciona la inferencia
+
+- **Entrada**: `images` `[1,640,640,3]` float32 **NHWC** (TF.js construye el tensor
+  directamente desde el canvas con `tf.browser.fromPixels`, sin empaquetado manual).
+- **Salidas** (mismo contenido que en el export ONNX original de Ultralytics):
+  - `output_0` → `[1,116,8400]`: 4 coords de caja + 80 puntuaciones de clase + 32
+    coeficientes de máscara, por cada una de las 8400 celdas.
+  - `output_1` → `[1,160,160,32]` (NHWC, prototipos de máscara — nótese que en ONNX era
+    `[1,32,160,160]` CHW; el índice de acceso en `yolo.js` está adaptado a NHWC).
+- **Postprocesado** (`yolo.js`): filtro por confianza, NMS por clase, y por cada
+  detección se reconstruye la máscara combinando los coeficientes con los prototipos
+  (sigmoide + umbral).
+- **Dibujado**: cajas, etiqueta+score y máscara semitransparente sobre un `<canvas>`
+  superpuesto al `<video>` (mismo tamaño y `object-fit` para que coincidan píxel a píxel).
+
+### Nombres de tensor de salida: no fiarse del orden del array
+
+`tf.GraphModel.execute()` puede devolver los tensores en un orden que **no** coincide con
+`output_0`/`output_1` tal como aparecen en la firma (`signature.outputs`) — en este modelo,
+`output_1` aparece antes que `output_0` en el propio `model.json`. Por eso `yolo.js` lee
+los nombres reales (`Identity:0` / `Identity_1:0`) del `model.json` al cargar y los pide
+explícitamente: `model.execute(inputs, [nombreOutput0, nombreOutput1])`.
 
 ### HUD de depuración
 
@@ -72,9 +112,9 @@ Servidor HTTPS escuchando en el puerto 8443
 ```
 
 El navegador avisará de certificado no confiable (es autofirmado): acepta el riesgo para
-continuar. Si haces cambios en el código, recarga con caché deshabilitada o sube el
-número de versión (`?v=N`) en los `<script>` de `index.html`, ya que el servidor no cachea
-pero el navegador puede hacerlo igualmente.
+continuar. Si haces cambios en el código, sube el número de versión (`?v=N`) en los
+`<script>` de `index.html`, ya que el servidor no cachea pero el navegador puede hacerlo
+igualmente.
 
 ### 2. Usar la app
 
@@ -82,11 +122,22 @@ pero el navegador puede hacerlo igualmente.
 2. Ajusta el slider **"Confianza"** si no ves detecciones (bájalo a ~0.15–0.25).
 3. **"Cambiar cámara"** alterna entre trasera/frontal.
 
-### 3. Actualizar el modelo
+## GPU en el navegador: qué garantiza (y qué no) TF.js
 
-Si reexportas el `.onnx`, sustituye `web/model.onnx` (el nombre de archivo y las
-entradas/salidas `images` / `output0` / `output1` deben mantenerse, o habrá que ajustar
-`yolo.js`).
+- **WebGPU es el "delegate" de GPU real**: los kernels corren sobre la GPU del sistema a
+  través de la API WebGPU del navegador. El backend WebGPU de TF.js lleva más tiempo
+  madurando que el de `onnxruntime-web` y tiene mejor cobertura de operadores para este
+  tipo de grafos (ver [Historial](#historial-por-qué-tensorflowjs-y-no-onnxruntime-web)).
+- **No se puede "forzar" GPU de forma universal en todos los móviles**: WebGPU depende
+  del navegador y del dispositivo (bien soportado en Chrome/Edge Android recientes, más
+  limitado en Safari/iOS, experimental en Firefox). Cuando no está disponible, la app cae
+  a **WASM** y por último a **CPU** (JS puro) — el único camino garantizado en cualquier
+  navegador.
+- El HUD muestra siempre el backend real en uso: `Detectando (webgpu)`, `(wasm)` o `(cpu)`.
+- GitHub Pages no permite fijar cabeceras `Cross-Origin-Opener-Policy`/
+  `Cross-Origin-Embedder-Policy`, así que en ese despliegue el WASM de TF.js no puede usar
+  `SharedArrayBuffer` (sigue funcionando, solo que sin multi-hilo). WebGPU no se ve
+  afectado por esto.
 
 ## Despliegue automático (GitHub Pages)
 
@@ -102,91 +153,39 @@ Pasos de configuración (una sola vez, en el repositorio de GitHub):
 3. También se puede lanzar a mano desde **Actions → Deploy web app to GitHub Pages →
    Run workflow**.
 
-Diferencias respecto al servidor local (`server.js`):
-- GitHub Pages ya sirve por **HTTPS** con certificado válido → no hace falta aceptar
-  ningún aviso de certificado, y `getUserMedia` funciona directamente en el móvil.
-- GitHub Pages **no permite fijar cabeceras personalizadas**, así que no se puede activar
-  `Cross-Origin-Opener-Policy`/`Cross-Origin-Embedder-Policy` ahí. Resultado: en
-  producción el fallback WASM corre siempre a **1 hilo** (`crossOriginIsolated` será
-  `false`); WebGPU no se ve afectado por esto. Si en el futuro se necesita WASM
-  multi-hilo en producción, hay que servir desde una plataforma que permita esas
-  cabeceras (Cloudflare Pages, Netlify, Vercel, un servidor propio, etc.).
-
-`web/model.onnx` ahora se versiona en git (se quitó de `.gitignore`) porque GitHub Pages
-sólo publica archivos del repositorio; si el modelo creciera mucho o cambiara a menudo,
-valdría la pena migrarlo a [Git LFS](https://git-lfs.com/).
-
-## Sobre el flag `half` al exportar
-
-```
-yolo export model=yolo11n-seg.pt format=onnx half=True opset=17
-```
-
-En la versión de `ultralytics` instalada aquí (**8.4.160**) el argumento `half` está
-**obsoleto**: el exportador ONNX ahora usa `quantize=16` para pedir FP16, y solo se aplica
-si el export se ejecuta en GPU (`device.type != "cpu"`). Como el export corrió en CPU,
-`half=True` no tuvo efecto y el `model.onnx` resultante quedó en **FP32** (verificado:
-`images`, `output0`, `output1` son todos `float32`). Esto explica por qué no hubo
-problemas de tipos con el `Float32Array` que se envía desde JavaScript.
-
-Recomendación:
-- Para servir en el navegador, **FP32 es lo correcto**: `onnxruntime-web` (tanto WASM
-  como WebGPU) tiene mucho mejor soporte y rendimiento con FP32 que con FP16, y evita
-  conversiones de tipo en el cliente.
-- Si en el futuro quieres forzar FP16 realmente (por ejemplo para reducir el tamaño del
-  archivo a la mitad), usa el flag actual y ejecuta el export en GPU:
-  ```bash
-  yolo export model=yolo11n-seg.pt format=onnx quantize=16 opset=17 device=0
-  ```
-  Ten en cuenta que entonces el input/output del modelo pasaría a ser `float16`, y habría
-  que adaptar `yolo.js` (crear el tensor de entrada como `"float16"` con un
-  `Uint16Array` empaquetado, y decodificar las salidas igual). Para este caso de uso
-  (un solo modelo `nano`, tamaño ya pequeño) no compensa la complejidad añadida: quédate
-  con el export por defecto en FP32.
-
-## GPU en el navegador: qué garantiza (y qué no) `onnxruntime-web`
-
-- **WebGPU *es* el "delegate" de GPU** en el navegador: cuando `onnxruntime-web` usa el
-  execution provider `webgpu`, los kernels corren realmente sobre la GPU del sistema a
-  través de la API WebGPU del navegador (no es un fallback de CPU disfrazado). El "Error
-  de inferencia" que veíamos antes (`Softmax` del módulo DFL) era justo eso: un kernel
-  concreto sin implementar en el JSEP de WebGPU de esta versión de `onnxruntime-web`, no
-  una señal de que WebGPU no se estuviera usando.
-- **No se puede "forzar" GPU de forma universal en todos los móviles**: a diferencia de
-  delegates nativos (NNAPI/CoreML en apps nativas), WebGPU depende del navegador y del
-  dispositivo. Soporte real a día de hoy: Chrome/Edge en Android (bastante maduro),
-  Safari/iOS (soporte más reciente y limitado según versión de iOS), navegadores basados
-  en Firefox (aún experimental). Cuando WebGPU no está disponible, la app cae a WASM
-  (CPU) automáticamente — es el único "delegate" universal que garantiza que la app
-  funcione en cualquier navegador.
-- **Para que el fallback de CPU sea lo más eficiente posible**, `server.js` envía las
-  cabeceras `Cross-Origin-Opener-Policy`/`Cross-Origin-Embedder-Policy`, que habilitan
-  `SharedArrayBuffer` y por tanto WASM **multi-hilo** (`ort.env.wasm.numThreads` se ajusta
-  automáticamente al número de núcleos si el contexto está "cross-origin isolated").
-- El HUD muestra siempre el backend real en uso: `Detectando (webgpu)` o
-  `Detectando (wasm)`, para verificarlo en cada dispositivo.
-
-## Soporte FP16 (`quantize=16`)
-
-`yolo.js` ya no asume FP32: al cargar el modelo hace una pasada de calentamiento
-probando primero `float32` y luego `float16`, y usa el que el modelo acepte. Los
-navegadores no tienen `Float16Array` nativo, así que los tensores fp16 se empaquetan/
-desempaquetan a mano (bits IEEE-754 half-precision) tanto en la entrada (`images`) como
-en las salidas (`output0`, `output1`) antes del postprocesado. Esto permite usar
-directamente el `model.onnx` exportado con `quantize=16 device=0` sin tocar código.
-
-Ventaja real de FP16 aquí: modelo más pequeño de descargar (importante en móvil) y,
-donde el backend WebGPU soporte bien los kernels en fp16, menor uso de memoria/ancho de
-banda en la GPU. El coste es la conversión fp16↔fp32 en JS en cada frame (CPU), que para
-un modelo `nano` es asumible.
+`web/tfjs_model/` se versiona en git porque GitHub Pages sólo publica archivos del
+repositorio; si el modelo creciera mucho o cambiara a menudo, valdría la pena migrarlo a
+[Git LFS](https://git-lfs.com/).
 
 ## ¿Hace falta el fichero `.pt`?
 
-No, para la app web **no se usa en ningún momento** — solo lee `web/model.onnx`. El
+No, para la app web **no se usa en ningún momento** — solo lee `web/tfjs_model/`. El
 `.pt` (pesos de PyTorch) sólo es necesario si quieres **volver a exportar** el modelo más
-adelante (otro `opset`, `imgsz`, `quantize`, cuantización INT8, TensorRT, etc.), ya que el
-`.onnx` no se puede "reexportar" a otro formato con la misma fidelidad. Si no vas a tocar
-el modelo, puedes borrar `yolo11n-seg.pt` con seguridad; si crees que volverás a exportar,
-consérvalo (o vuelve a descargarlo con `yolo` cuando lo necesites, ya que Ultralytics lo
-descarga automáticamente si falta).
+adelante (otro `opset`, `imgsz`, cuantización, etc.). Si no vas a tocar el modelo, puedes
+borrarlo con seguridad; Ultralytics lo vuelve a descargar automáticamente si falta.
+
+## Historial: por qué TensorFlow.js y no onnxruntime-web
+
+La primera versión de esta app usaba `onnxruntime-web` con `model.onnx`. Se abandonó tras
+dos bloqueos reales (no eran errores de configuración):
+
+1. **Softmax fuera del último eje**: el módulo DFL de YOLO11 (`Reshape → Transpose →
+   Softmax(axis=1) → Conv`) hace softmax sobre un eje intermedio de un tensor
+   `[1,16,4,8400]`. El backend WebGPU (JSEP) de `onnxruntime-web` en la versión usada solo
+   soporta softmax sobre el **último** eje. Se llegó a parchear el grafo ONNX
+   (`scripts/fix_dfl_softmax_axis.py`, insertando `Transpose`s) y funcionó, pero reveló
+   que la cobertura de operadores de ese backend va muy por detrás de WASM.
+2. **Convoluciones agrupadas (`groups>1`)**: al migrar a TensorFlow.js nos encontramos con
+   un problema análogo pero en un motor distinto: `onnx2tf` convertía las convoluciones
+   *depthwise* del bloque de atención y de la cabeza de clasificación de YOLO11 como
+   `Conv2D` genérico con `groups>1`, algo que TF.js no soporta
+   (`Error in conv2d: depth of input (128) must match input depth for filter 1`). Se
+   resolvió pasando `disable_group_convolution=True` a `onnx2saved_model()`, que las
+   descompone en operaciones equivalentes que TF.js sí soporta.
+
+Conclusión práctica: **cualquier motor de inferencia en el navegador para una red YOLO
+moderna (v8+) puede toparse con huecos de cobertura de operadores**, sobre todo en el
+backend GPU. No es algo específico de este modelo ni de cómo se exportó — es el estado
+actual de madurez de la inferencia ML en navegador. La app está preparada para degradar
+con elegancia (fallback automático de backend) precisamente por eso.
 
