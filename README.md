@@ -39,10 +39,10 @@ flowchart TD
    onnx2saved_model("yolo11n-seg.onnx", "yolo11n-seg_saved_model",
                      disable_group_convolution=True, cuda=False)
    ```
-4. **SavedModel → TF.js**, en un **venv aislado** (`.venv-tfjs`) para evitar el conflicto de `protobuf` entre `onnx`/`tensorflow`/`tensorflow_decision_forests`:
+4. **SavedModel → TF.js**, en un **venv aislado** (`.venv-tfjs`) para evitar el conflicto de `protobuf` entre `onnx`/`tensorflow`/`tensorflow_decision_forests` (por eso sus dependencias viven en [requirements-tfjs.txt](requirements-tfjs.txt), separadas de [requirements.txt](requirements.txt)):
    ```bash
    python3 -m venv .venv-tfjs && source .venv-tfjs/bin/activate
-   pip install tensorflowjs
+   pip install -r requirements-tfjs.txt
    tensorflowjs_converter --input_format=tf_saved_model \
      --output_format=tfjs_graph_model --signature_name=serving_default \
      yolo11n-seg_saved_model web/tfjs_model
