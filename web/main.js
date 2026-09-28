@@ -111,24 +111,9 @@ function draw(detections) {
   octx.clearRect(0, 0, overlay.width, overlay.height);
 
   for (const det of detections) {
-    const [x1, y1, x2, y2] = det.box;
-    const color = classColor(det.classId);
-    const label = `${COCO_CLASSES[det.classId]} ${(det.score * 100).toFixed(0)}%`;
-
     if (det.mask) {
       const [dx, dy, dw, dh] = det.mask.dest;
       octx.drawImage(det.mask.canvas, dx, dy, dw, dh);
     }
-
-    octx.strokeStyle = color;
-    octx.lineWidth = 2;
-    octx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-
-    octx.font = "16px sans-serif";
-    const textW = octx.measureText(label).width;
-    octx.fillStyle = color;
-    octx.fillRect(x1, Math.max(0, y1 - 20), textW + 8, 20);
-    octx.fillStyle = "#000";
-    octx.fillText(label, x1 + 4, Math.max(14, y1 - 5));
   }
 }
