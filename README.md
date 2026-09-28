@@ -1,4 +1,4 @@
-# YOLO11-seg en el navegador (TensorFlow.js + WebGPU)
+# Segmentación personalizada en el navegador (TensorFlow.js + WebGPU)
 
 Segmentación de instancias en tiempo real usando la cámara del dispositivo, pensada para
 abrirse principalmente desde un **móvil**. Corre 100% en el cliente (no hay backend de
@@ -24,19 +24,19 @@ web/
 
 ```mermaid
 flowchart TD
-    A["yolo11n-seg.pt<br/>(pesos PyTorch, se descarga solo si falta)"] -->|"yolo export format=onnx opset=17"| B["yolo11n-seg.onnx<br/>(FP32, formato Ultralytics)"]
-    B -->|"onnx2saved_model()<br/>disable_group_convolution=True"| C["yolo11n-seg_saved_model/<br/>(TensorFlow SavedModel)"]
+    A["best.pt<br/>(pesos PyTorch entrenados)"] -->|"yolo export format=onnx opset=17"| B["best.onnx<br/>(FP32, formato Ultralytics)"]
+    B -->|"onnx2saved_model()<br/>disable_group_convolution=True"| C["best_saved_model/<br/>(TensorFlow SavedModel)"]
     C -->|"tensorflowjs_converter<br/>(venv aislado .venv-tfjs)"| D["web/tfjs_model/<br/>model.json + group1-shard*.bin"]
     D -->|"tf.loadGraphModel()"| E["yolo.js: YoloSegModel"]
     E --> F["main.js: cámara + bucle de inferencia"]
 ```
 
-1. **`yolo11n-seg.pt`**: pesos originales de Ultralytics.
-2. **Export a ONNX**: `yolo export model=yolo11n-seg.pt format=onnx opset=17` → `yolo11n-seg.onnx` (FP32). Ya no lo usa la app en producción; era el punto de partida del intento previo con `onnxruntime-web` (ver [Historial](#historial-por-qué-tensorflowjs-y-no-onnxruntime-web)).
+1. **`best.pt`**: pesos PyTorch del modelo de segmentación entrenado para 27 clases propias.
+2. **Export a ONNX**: `yolo export model=best.pt format=onnx opset=17` → `best.onnx` (FP32).
 3. **ONNX → SavedModel**, llamando directamente a la función interna de Ultralytics para poder pasar `disable_group_convolution=True` (necesario, ver más abajo):
    ```python
    from ultralytics.utils.export.tensorflow import onnx2saved_model
-   onnx2saved_model("yolo11n-seg.onnx", "yolo11n-seg_saved_model",
+  onnx2saved_model("best.onnx", "best_saved_model",
                      disable_group_convolution=True, cuda=False)
    ```
 4. **SavedModel → TF.js**, en un **venv aislado** (`.venv-tfjs`) para evitar el conflicto de `protobuf` entre `onnx`/`tensorflow`/`tensorflow_decision_forests` (por eso sus dependencias viven en [requirements-tfjs.txt](requirements-tfjs.txt), separadas de [requirements.txt](requirements.txt)):
@@ -45,7 +45,7 @@ flowchart TD
    pip install -r requirements-tfjs.txt
    tensorflowjs_converter --input_format=tf_saved_model \
      --output_format=tfjs_graph_model --signature_name=serving_default \
-     yolo11n-seg_saved_model web/tfjs_model
+    best_saved_model web/tfjs_model
    ```
 5. **Carga en el navegador**: `yolo.js` lee `web/tfjs_model/model.json`, extrae los
    nombres reales de los tensores de salida (ver nota más abajo) y llama a

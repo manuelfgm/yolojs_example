@@ -6,7 +6,7 @@
  *          output_1 [1,160,160,32] (prototipos de máscara, NHWC)
  */
 const YOLO_INPUT_SIZE = 640;
-const YOLO_NUM_CLASSES = 80;
+const YOLO_NUM_CLASSES = COCO_CLASSES.length;
 const YOLO_NUM_MASKS = 32;
 const PROTO_SIZE = 160;
 
@@ -23,7 +23,8 @@ class YoloSegModel {
   async load(modelUrl, onStatus) {
     // Los nombres reales de los tensores de salida no coinciden siempre con el orden
     // output_0/output_1 declarado en la firma, así que se leen explícitamente del model.json.
-    const manifest = await (await fetch(modelUrl)).json();
+    const artifacts = await this._fetchModelArtifacts(modelUrl, onStatus);
+    const manifest = artifacts.manifest;
     const outputs = manifest.signature?.outputs ?? manifest.userDefinedMetadata?.signature?.outputs;
     this._outputNames = [outputs.output_0.name, outputs.output_1.name];
 
@@ -31,10 +32,11 @@ class YoloSegModel {
     const backendAttempts = ["webgpu", "wasm", "cpu"];
     for (const backend of backendAttempts) {
       try {
-        onStatus?.(`Cargando modelo (${backend})…`);
+        onStatus?.(`Preparando ${backend}…`);
         await tf.setBackend(backend);
         await tf.ready();
-        this.model = await tf.loadGraphModel(modelUrl);
+        onStatus?.(`Inicializando modelo (${backend})…`);
+        this.model = await tf.loadGraphModel(tf.io.fromMemory(artifacts.modelArtifacts));
         this.backend = tf.getBackend();
         return this.backend;
       } catch (err) {
@@ -42,6 +44,43 @@ class YoloSegModel {
       }
     }
     throw new Error("No se pudo inicializar ningún backend de TensorFlow.js");
+  }
+
+  async _fetchModelArtifacts(modelUrl, onStatus) {
+    const manifestUrl = new URL(modelUrl, window.location.href);
+    const manifestResponse = await fetch(manifestUrl);
+    if (!manifestResponse.ok) throw new Error(`No se pudo cargar model.json (${manifestResponse.status})`);
+    const manifest = await manifestResponse.json();
+    const groups = manifest.weightsManifest ?? [];
+    const weightPaths = groups.flatMap((group) => group.paths);
+    const chunks = [];
+    let downloaded = 0;
+
+    for (const [index, path] of weightPaths.entries()) {
+      onStatus?.(`Descargando pesos… ${Math.round((downloaded / weightPaths.length) * 100)}%`);
+      const response = await fetch(new URL(path, manifestUrl));
+      if (!response.ok) throw new Error(`No se pudo cargar ${path} (${response.status})`);
+      chunks.push(new Uint8Array(await response.arrayBuffer()));
+      downloaded = index + 1;
+      onStatus?.(`Descargando pesos… ${Math.round((downloaded / weightPaths.length) * 100)}%`);
+    }
+
+    const totalBytes = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+    const weightData = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      weightData.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    return {
+      manifest,
+      modelArtifacts: {
+        modelTopology: manifest.modelTopology,
+        weightSpecs: groups.flatMap((group) => group.weights),
+        weightData: weightData.buffer,
+      },
+    };
   }
 
   /**

@@ -42,10 +42,8 @@ const server = https.createServer(options, (req, res) => {
     const ext = path.extname(filePath);
     res.writeHead(200, {
       "Content-Type": MIME[ext] || "application/octet-stream",
+      "Content-Length": data.length,
       "Cache-Control": "no-store, no-cache, must-revalidate",
-      // Habilita SharedArrayBuffer (WASM multi-hilo) marcando la página como "cross-origin isolated".
-      "Cross-Origin-Opener-Policy": "same-origin",
-      "Cross-Origin-Embedder-Policy": "require-corp",
     });
     res.end(data);
   });
