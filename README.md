@@ -18,6 +18,9 @@ web/
 ├── tfjs_model/           # grafo TF.js convertido (model.json + group1-shard*.bin)
 ├── server.js            # servidor HTTPS estático para pruebas (necesario en móvil)
 └── certs/               # certificado autofirmado usado por server.js
+
+scripts/
+└── onnx_to_saved_model.py # ONNX → SavedModel compatible con TF.js
 ```
 
 ## Flujo completo: del `.pt` a la app
@@ -33,19 +36,19 @@ flowchart TD
 
 1. **`best.pt`**: pesos PyTorch del modelo de segmentación entrenado para 27 clases propias.
 2. **Export a ONNX**: `yolo export model=best.pt format=onnx opset=17` → `best.onnx` (FP32).
-3. **ONNX → SavedModel**, llamando directamente a la función interna de Ultralytics para poder pasar `disable_group_convolution=True` (necesario, ver más abajo):
-   ```python
-   from ultralytics.utils.export.tensorflow import onnx2saved_model
-  onnx2saved_model("best.onnx", "best_saved_model",
-                     disable_group_convolution=True, cuda=False)
+3. **ONNX → SavedModel**, usando el script [scripts/onnx_to_saved_model.py](scripts/onnx_to_saved_model.py). Activa el entorno principal (`.venv`), que contiene Ultralytics y `onnx2tf`; el script pasa `disable_group_convolution=True`, necesario para TF.js:
+   ```bash
+   source .venv/bin/activate
+   python scripts/onnx_to_saved_model.py best.onnx best_saved_model --overwrite
    ```
 4. **SavedModel → TF.js**, en un **venv aislado** (`.venv-tfjs`) para evitar el conflicto de `protobuf` entre `onnx`/`tensorflow`/`tensorflow_decision_forests` (por eso sus dependencias viven en [requirements-tfjs.txt](requirements-tfjs.txt), separadas de [requirements.txt](requirements.txt)):
    ```bash
-   python3 -m venv .venv-tfjs && source .venv-tfjs/bin/activate
+   python3 -m venv .venv-tfjs  # Solo la primera vez
+   source .venv-tfjs/bin/activate
    pip install -r requirements-tfjs.txt
    tensorflowjs_converter --input_format=tf_saved_model \
      --output_format=tfjs_graph_model --signature_name=serving_default \
-    best_saved_model web/tfjs_model
+     best_saved_model web/tfjs_model
    ```
 5. **Carga en el navegador**: `yolo.js` lee `web/tfjs_model/model.json`, extrae los
    nombres reales de los tensores de salida (ver nota más abajo) y llama a
